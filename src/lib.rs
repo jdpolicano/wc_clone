@@ -24,7 +24,7 @@ default is lines, chars, bytes....
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Read};
 
 #[derive(Debug)] 
 pub struct CommandOptions {
@@ -35,8 +35,23 @@ pub struct CommandOptions {
     files: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct FileStats {
+    word_count: i32,
+    char_count: i32,
+    byte_count: i32,
+    line_count: i32,
+}
 
-impl CommandOptions{
+
+
+pub enum ReadResult {
+    Utf8(String),
+    Binary(Vec<u8>),
+    ReadError(Box<dyn Error>)
+}
+
+impl CommandOptions {
     fn new() -> Self {
         Self {
             count_bytes: false,
@@ -46,42 +61,7 @@ impl CommandOptions{
             files: Vec::new()
         }
     }
-}
 
-#[derive(Debug)]
-pub struct FileStats {
-    word_count: i32,
-    char_count: i32,
-    byte_count: i32,
-    line_count: i32,
-}
-
-impl FileStats {
-    fn new() -> Self {
-        Self {
-            word_count: 0,
-            char_count: 0,
-            byte_count: 0,
-            line_count: 0,
-        }
-    }
-
-    fn add(&mut self, other: &FileStats) {
-        self.word_count += other.word_count;
-        self.char_count += other.char_count;
-        self.byte_count += other.byte_count;
-        self.line_count += other.line_count;
-    }
-}
-
-
-pub enum FileReadResult {
-    Utf8(String),
-    Binary(Vec<u8>),
-    ReadError(Box<dyn Error>)
-}
-
-impl CommandOptions {
     pub fn build(mut argv: impl Iterator<Item=String>) -> Result<CommandOptions, String> {
         argv.next(); // assume for now the exec path is the first arg and skip it...
 
@@ -132,8 +112,53 @@ impl CommandOptions {
     }
 }
 
+impl FileStats {
+    fn new() -> Self {
+        Self {
+            word_count: 0,
+            char_count: 0,
+            byte_count: 0,
+            line_count: 0,
+        }
+    }
 
+    fn add(&mut self, other: &FileStats) {
+        self.word_count += other.word_count;
+        self.char_count += other.char_count;
+        self.byte_count += other.byte_count;
+        self.line_count += other.line_count;
+    }
+}
+// Main "run" programs either reads from stdin (if TTY), else will parse command options an execute on file's from options...
 pub fn run() {
+    if io::stdin().lock().is_terminal() {
+        run_from_term();
+    } else {
+        run_from_stdin();
+    }
+}
+
+// reads from stdin and then applies stat logic either on an in memory string or a raw buffer.
+pub fn run_from_stdin() {
+    // read stdin to a string, on failure default to 
+    let mut stdin = io::stdin();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut default_options = CommandOptions::new();
+    default_options.count_lines = true;
+    default_options.count_words = true;
+    default_options.count_bytes = true;
+
+    if let Ok(_) = stdin.read_to_end(&mut buffer) {
+        let stats = match std::str::from_utf8(&buffer) {
+            Ok(s) => get_stats(&s),
+            Err(_) => get_stats_bin(&buffer)
+        };
+    
+        print_run_results(&default_options, &stats, "");
+    }
+}
+
+pub fn run_from_term() {
     match CommandOptions::build(env::args()) {
         Ok(mut command_options) => {
             let mut all_stats: Vec<(FileStats, &str)> = Vec::new();
@@ -141,20 +166,20 @@ pub fn run() {
 
             for file in &command_options.files {
                 match read_file(&file) {
-                    FileReadResult::Utf8(utf8) => { 
-                        let file_stats = get_file_stats(&utf8);
+                    ReadResult::Utf8(utf8) => { 
+                        let file_stats = get_stats(&utf8);
                         all_stats.push((file_stats, file));
                     },
-                    FileReadResult::Binary(bin) => { 
+                    ReadResult::Binary(bin) => { 
                         // this is very simple and probably incorrect but enough for now, this is a learning exercise :).
                         if command_options.count_chars {
                             println!("wc_clone: {} Illegal byte sequence", file); 
                             command_options.count_chars = false;
                         }
-                        let file_stats = get_file_stats_bin(&bin);
+                        let file_stats = get_stats_bin(&bin);
                         all_stats.push((file_stats, file));
                     },
-                    FileReadResult::ReadError(err) => {
+                    ReadResult::ReadError(err) => {
                         println!("Encounted error reading file {}: {}", file, err)
                     }
                 }
@@ -177,17 +202,17 @@ pub fn run() {
 /*
 Reads a file as utf8 and falls back to processing as byte vec if unable to parse as valid utf8..
 */
-pub fn read_file(path: &str) -> FileReadResult {
+pub fn read_file(path: &str) -> ReadResult {
     match fs::read_to_string(path) {
-        Ok(utf8_file) => FileReadResult::Utf8(utf8_file),
+        Ok(utf8_file) => ReadResult::Utf8(utf8_file),
         Err(io_err) => {
             if io_err.kind() == io::ErrorKind::InvalidData {
                 match fs::read(path) {
-                    Ok(binary_file) => FileReadResult::Binary(binary_file),
-                    Err(err) => FileReadResult::ReadError(Box::new(err)),
+                    Ok(binary_file) => ReadResult::Binary(binary_file),
+                    Err(err) => ReadResult::ReadError(Box::new(err)),
                 }
             } else {
-                FileReadResult::ReadError(Box::new(io_err))
+                ReadResult::ReadError(Box::new(io_err))
             }
         }
     }
@@ -196,7 +221,7 @@ pub fn read_file(path: &str) -> FileReadResult {
 /*
 Same as utf8 implementation, only it operates on binary directly...
 */
-fn get_file_stats(file_content: &str) -> FileStats {
+fn get_stats(file_content: &str) -> FileStats {
     let mut run_results = FileStats::new();
 
     run_results.byte_count = file_content.len() as i32;
@@ -233,7 +258,7 @@ fn get_file_stats(file_content: &str) -> FileStats {
 Prints run results based on the user configuration and a utf8 string...will return a 4 len vec containing the count of each data point.
 This is useful for aggregating the results...
 */
-fn get_file_stats_bin(file_content: &[u8]) -> FileStats {
+fn get_stats_bin(file_content: &[u8]) -> FileStats {
     let mut run_results = FileStats::new();
 
     run_results.byte_count = file_content.len() as i32;
