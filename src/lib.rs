@@ -144,6 +144,7 @@ pub fn run_from_stdin() {
     let mut stdin = io::stdin();
     let mut buffer: Vec<u8> = Vec::new();
     let mut default_options = CommandOptions::new();
+    
     default_options.count_lines = true;
     default_options.count_words = true;
     default_options.count_bytes = true;
